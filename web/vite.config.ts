@@ -41,6 +41,8 @@ function localPluginsManifest(): Plugin {
 export default defineConfig({
     base: process.env.VITE_BASE || "/",
     plugins: [react(), localPluginsManifest()],
+    // Keep FFmpeg's module worker URL relative to its package during development.
+    optimizeDeps: { exclude: ["@ffmpeg/ffmpeg"] },
     resolve: {
         alias: {
             "@": resolve(webDir, "src"),

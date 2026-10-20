@@ -1,0 +1,154 @@
+name: M0 - Docker Hub image manifest diagnostic
+
+on:
+  push:
+    branches:
+      - codex/m0-container-probe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect public Docker Hub repository and latest manifest
+        id: manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from urllib.request import Request, urlopen
+
+          repository = "zoonqi/ai_coding"
+          tag = "latest"
+          registry = f"https://registry-1.docker.io/v2/{repository}"
+
+          def fetch(url, headers=None):
+              with urlopen(Request(url, headers=headers or {})) as response:
+                  return json.load(response), response.headers
+
+          auth, _ = fetch(f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repository}:pull")
+          token = auth["token"]
+          if not token:
+              raise RuntimeError("Docker Hub returned an empty pull token")
+          print(f"::add-mask::{token}", flush=True)
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": ", ".join([
+                  "application/vnd.oci.image.index.v1+json",
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+              ]),
+          }
+          tags, _ = fetch(f"{registry}/tags/list?n=100", headers)
+          print(json.dumps(tags, indent=2))
+          manifest, response_headers = fetch(f"{registry}/manifests/{tag}", headers)
+          digest = response_headers["Docker-Content-Digest"]
+          print(f"Tag digest: {digest}")
+          print(json.dumps(manifest, indent=2))
+
+          selected_digest = digest
+          if "manifests" in manifest:
+              descriptor = next((item for item in manifest["manifests"]
+                  if item.get("platform", {}).get("os") == "linux"
+                  and item.get("platform", {}).get("architecture") == "amd64"), None)
+              if descriptor is None:
+                  raise RuntimeError("The image index has no linux/amd64 manifest")
+              selected_digest = descriptor["digest"]
+              manifest, _ = fetch(f"{registry}/manifests/{selected_digest}", headers)
+              print(f"Selected linux/amd64 manifest: {selected_digest}")
+              print(json.dumps(manifest, indent=2))
+
+          artifact_type = manifest.get("artifactType") or ""
+          config_type = manifest.get("config", {}).get("mediaType", "")
+          runnable = not artifact_type and config_type in {
+              "application/vnd.oci.image.config.v1+json",
+              "application/vnd.docker.container.image.v1+json",
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"runnable={str(runnable).lower()}\ndigest={digest}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(
+                  "## AI coding registry diagnostic\n\n"
+                  f"- Reference: `docker.io/{repository}:{tag}`\n"
+                  f"- Tags: `{', '.join(tags.get('tags') or [])}`\n"
+                  f"- Tag digest: `{digest}`\n"
+                  f"- Selected manifest: `{selected_digest}`\n"
+                  f"- Manifest media type: `{manifest.get('mediaType', '')}`\n"
+                  f"- Artifact type: `{artifact_type or 'none'}`\n"
+                  f"- Config media type: `{config_type}`\n"
+                  f"- Runnable container candidate: `{str(runnable).lower()}`\n"
+              )
+              if not runnable:
+                  summary.write("- Runtime probe: **BLOCKED**; this reference is an OCI artifact, not a runnable container image. Docker pull was skipped.\n")
+                  print("::warning::Runtime probe BLOCKED: the registry reference is an OCI artifact; runnable=false. Supply a runnable AI coding image reference.")
+              else:
+                  image = f"docker.io/{repository}@{digest}"
+                  result = subprocess.run(["docker", "pull", "--platform", "linux/amd64", image])
+                  summary.write(f"- Pull result: {'passed' if result.returncode == 0 else 'failed'} (linux/amd64, pinned tag digest)\n")
+                  summary.flush()
+                  result.check_returncode()
+                  subprocess.run(["docker", "image", "inspect", image], check=True)
+          PY
+
+  probe-codex-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout the exact source under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Build a disposable Codex coding runtime
+        shell: bash
+        env:
+          IMAGE: m0-codex-runtime:${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          docker build --platform linux/amd64 -f docker/ai-coding-runtime/Dockerfile -t "$IMAGE" .
+          docker image inspect "$IMAGE" --format 'Local image ID={{.Id}} OS={{.Os}} ARCH={{.Architecture}}'
+
+      - name: Probe the coding runtime without model credentials
+        shell: bash
+        env:
+          IMAGE: m0-codex-runtime:${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          docker run --rm --network none \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --workdir /workspace \
+            "$IMAGE" bash -lc '
+              set -Eeuo pipefail
+              for command in bash git node npm bun codex; do
+                command -v "$command"
+              done
+              test -f web/package.json
+              node --version
+              npm --version
+              bun --version
+              git --version
+              codex --version
+            '
+
+      - name: Record the disposable runtime result
+        if: always()
+        shell: bash
+        env:
+          IMAGE: m0-codex-runtime:${{ github.sha }}
+        run: |
+          {
+            echo "## Disposable Codex coding runtime"
+            echo ""
+            echo "- Image: \`$IMAGE\` (built locally for linux/amd64; not pushed to a registry)"
+            echo "- Runtime: Node 22, Bun 1.3.13, Git, Bash, and Codex CLI 0.163.0"
+            echo "- Probe: tool versions and read-only source mount; no model credentials were supplied"
+          } >> "$GITHUB_STEP_SUMMARY"
