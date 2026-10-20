@@ -1,0 +1,143 @@
+name: M0 - AI coding image and Infinite Canvas smoke test
+
+on:
+  push:
+    branches:
+      - codex/m0-container-probe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout workflow host repository
+        uses: actions/checkout@v4
+
+      - name: Pull and inspect AI coding image
+        id: ai_image
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          IMAGE="docker.io/zoonqi/ai_coding:latest"
+          if ! docker pull "$IMAGE"; then
+            echo "pull_ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Could not pull $IMAGE; continue with the application smoke test."
+            exit 0
+          fi
+          echo "pull_ok=true" >> "$GITHUB_OUTPUT"
+          docker image inspect "$IMAGE" --format 'Image={{.RepoTags}} OS={{.Os}} ARCH={{.Architecture}} ENTRYPOINT={{json .Config.Entrypoint}} CMD={{json .Config.Cmd}}'
+          if docker run --rm --network none --entrypoint /bin/sh "$IMAGE" -lc '
+            for c in git bash node npm pnpm bun go docker; do
+              if command -v "$c" >/dev/null 2>&1; then printf "%-8s %s\n" "$c" "$(command -v "$c")";
+              else printf "%-8s NOT_FOUND\n" "$c"; fi
+            done
+            if command -v docker >/dev/null 2>&1; then docker compose version 2>&1 || true; fi
+          '; then
+            echo "shell_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "shell_ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The image does not support the /bin/sh tool probe."
+          fi
+
+      - name: Clone the pinned Infinite Canvas source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git clone https://github.com/tigerowo/infinite-canvas.git /tmp/infinite-canvas
+          git -C /tmp/infinite-canvas checkout --detach ccda172efba25cbee990a785bba715b90cc42b95
+          test "$(git -C /tmp/infinite-canvas rev-parse HEAD)" = "ccda172efba25cbee990a785bba715b90cc42b95"
+          grep -q '^module github.com/tigerowo/infinite-canvas$' /tmp/infinite-canvas/go.mod
+          test -f /tmp/infinite-canvas/docker-compose.local.yml
+
+      - name: Prepare disposable test configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd /tmp/infinite-canvas
+          cp .env.example .env
+          python3 - <<'PY'
+          from pathlib import Path
+          import secrets
+          p = Path(".env")
+          lines = p.read_text(encoding="utf-8").splitlines()
+          values = {
+              "ADMIN_USERNAME": "admin",
+              "ADMIN_PASSWORD": secrets.token_urlsafe(24),
+              "JWT_SECRET": secrets.token_hex(32),
+              "DATABASE_DSN": "/app/data/infinite-canvas.db",
+              "STORAGE_DRIVER": "sqlite",
+          }
+          seen = set()
+          out = []
+          for line in lines:
+              key = line.split("=", 1)[0] if "=" in line else ""
+              if key in values:
+                  out.append(f"{key}={values[key]}")
+                  seen.add(key)
+              else:
+                  out.append(line)
+          for key, value in values.items():
+              if key not in seen:
+                  out.append(f"{key}={value}")
+          p.write_text("\n".join(out) + "\n", encoding="utf-8")
+          PY
+          chmod 600 .env
+          mkdir -p data
+          docker compose -f docker-compose.local.yml config --quiet
+
+      - name: Build and start Infinite Canvas
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd /tmp/infinite-canvas
+          docker compose -f docker-compose.local.yml up -d --build
+
+      - name: Smoke test the web app
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd /tmp/infinite-canvas
+          ok=0
+          for i in $(seq 1 90); do
+            code="$(curl -sS -o /tmp/infinite-canvas-home.html -w '%{http_code}' --max-time 5 http://127.0.0.1:3000/ || true)"
+            if [[ "$code" =~ ^2[0-9][0-9]$|^3[0-9][0-9]$ ]] && [[ -s /tmp/infinite-canvas-home.html ]]; then
+              echo "HTTP smoke test passed (status=$code, body_bytes=$(wc -c < /tmp/infinite-canvas-home.html))."
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$ok" -ne 1 ]]; then
+            echo "Web smoke test did not pass. Recent compose logs:"
+            docker compose -f docker-compose.local.yml logs --tail=160
+            exit 1
+          fi
+
+      - name: Record results
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## M0 Docker smoke test"
+            echo ""
+            echo "- AI coding image pull: ${{ steps.ai_image.outputs.pull_ok || 'not completed' }}"
+            echo "- AI coding image shell probe: ${{ steps.ai_image.outputs.shell_ok || 'not completed' }}"
+            echo "- Infinite Canvas source pin: ccda172efba25cbee990a785bba715b90cc42b95"
+            echo "- Application smoke test: see preceding step logs."
+            echo ""
+            echo "The workflow does not save model API keys or publish the test app. Test data stays on the ephemeral runner."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up test containers
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d /tmp/infinite-canvas ]]; then
+            cd /tmp/infinite-canvas
+            docker compose -f docker-compose.local.yml down -v --remove-orphans || true
+          fi
