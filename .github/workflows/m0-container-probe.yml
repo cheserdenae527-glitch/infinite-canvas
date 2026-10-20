@@ -1,4 +1,4 @@
-name: M0 - AI coding image and Infinite Canvas smoke test
+name: M0 - Infinite Canvas source and container smoke test
 
 on:
   push:
@@ -14,130 +14,132 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Checkout workflow host repository
+      - name: Checkout the exact source under test
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - name: Pull and inspect AI coding image
-        id: ai_image
-        shell: bash
-        continue-on-error: true
-        run: |
-          set +e
-          IMAGE="docker.io/zoonqi/ai_coding:latest"
-          if ! docker pull "$IMAGE"; then
-            echo "pull_ok=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Could not pull $IMAGE; continue with the application smoke test."
-            exit 0
-          fi
-          echo "pull_ok=true" >> "$GITHUB_OUTPUT"
-          docker image inspect "$IMAGE" --format 'Image={{.RepoTags}} OS={{.Os}} ARCH={{.Architecture}} ENTRYPOINT={{json .Config.Entrypoint}} CMD={{json .Config.Cmd}}'
-          if docker run --rm --network none --entrypoint /bin/sh "$IMAGE" -lc '
-            for c in git bash node npm pnpm bun go docker; do
-              if command -v "$c" >/dev/null 2>&1; then printf "%-8s %s\n" "$c" "$(command -v "$c")";
-              else printf "%-8s NOT_FOUND\n" "$c"; fi
-            done
-            if command -v docker >/dev/null 2>&1; then docker compose version 2>&1 || true; fi
-          '; then
-            echo "shell_ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "shell_ok=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::The image does not support the /bin/sh tool probe."
-          fi
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
 
-      - name: Clone the pinned Infinite Canvas source
+      - name: Verify the source revision and static container configuration
         shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
-          git clone https://github.com/tigerowo/infinite-canvas.git /tmp/infinite-canvas
-          git -C /tmp/infinite-canvas checkout --detach ccda172efba25cbee990a785bba715b90cc42b95
-          test "$(git -C /tmp/infinite-canvas rev-parse HEAD)" = "ccda172efba25cbee990a785bba715b90cc42b95"
-          grep -q '^module github.com/tigerowo/infinite-canvas$' /tmp/infinite-canvas/go.mod
-          test -f /tmp/infinite-canvas/docker-compose.local.yml
-
-      - name: Prepare disposable test configuration
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd /tmp/infinite-canvas
-          cp .env.example .env
-          python3 - <<'PY'
-          from pathlib import Path
-          import secrets
-          p = Path(".env")
-          lines = p.read_text(encoding="utf-8").splitlines()
-          values = {
-              "ADMIN_USERNAME": "admin",
-              "ADMIN_PASSWORD": secrets.token_urlsafe(24),
-              "JWT_SECRET": secrets.token_hex(32),
-              "DATABASE_DSN": "/app/data/infinite-canvas.db",
-              "STORAGE_DRIVER": "sqlite",
-          }
-          seen = set()
-          out = []
-          for line in lines:
-              key = line.split("=", 1)[0] if "=" in line else ""
-              if key in values:
-                  out.append(f"{key}={values[key]}")
-                  seen.add(key)
-              else:
-                  out.append(line)
-          for key, value in values.items():
-              if key not in seen:
-                  out.append(f"{key}={value}")
-          p.write_text("\n".join(out) + "\n", encoding="utf-8")
-          PY
-          chmod 600 .env
-          mkdir -p data
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -f web/package.json
           docker compose -f docker-compose.local.yml config --quiet
+
+      - name: Install frontend dependencies and run the source tests
+        id: source_tests
+        shell: bash
+        working-directory: web
+        run: |
+          set -Eeuo pipefail
+          bun install --frozen-lockfile
+          bun test
+
+      - name: Test the workflow regression fixtures
+        shell: bash
+        run: python3 tests/m0-workflows.test.py
 
       - name: Build and start Infinite Canvas
         shell: bash
         run: |
           set -Eeuo pipefail
-          cd /tmp/infinite-canvas
           docker compose -f docker-compose.local.yml up -d --build
 
       - name: Smoke test the web app
+        id: web_smoke
         shell: bash
         run: |
           set -Eeuo pipefail
-          cd /tmp/infinite-canvas
-          ok=0
-          for i in $(seq 1 90); do
-            code="$(curl -sS -o /tmp/infinite-canvas-home.html -w '%{http_code}' --max-time 5 http://127.0.0.1:3000/ || true)"
-            if [[ "$code" =~ ^2[0-9][0-9]$|^3[0-9][0-9]$ ]] && [[ -s /tmp/infinite-canvas-home.html ]]; then
-              echo "HTTP smoke test passed (status=$code, body_bytes=$(wc -c < /tmp/infinite-canvas-home.html))."
-              ok=1
-              break
-            fi
-            sleep 2
-          done
-          if [[ "$ok" -ne 1 ]]; then
-            echo "Web smoke test did not pass. Recent compose logs:"
-            docker compose -f docker-compose.local.yml logs --tail=160
-            exit 1
-          fi
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          import subprocess
+          import time
+          from urllib.parse import urljoin, urlparse
+          from urllib.request import urlopen
+
+          origin = "http://127.0.0.1:3000/"
+
+          class Page(HTMLParser):
+              root = False
+              modules = None
+
+              def __init__(self):
+                  super().__init__()
+                  self.modules = []
+
+              def handle_starttag(self, tag, attributes):
+                  attributes = dict(attributes)
+                  if tag == "div" and attributes.get("id") == "root":
+                      self.root = True
+                  if tag == "script" and attributes.get("type") == "module" and attributes.get("src"):
+                      self.modules.append(attributes["src"])
+
+          try:
+              for attempt in range(90):
+                  try:
+                      with urlopen(origin, timeout=5) as response:
+                          body = response.read()
+                          if response.status == 200 and body:
+                              assert response.geturl() == origin, "Root unexpectedly redirected"
+                              assert response.headers.get_content_type() == "text/html", "Root is not HTML"
+                              break
+                  except OSError:
+                      pass
+                  time.sleep(2)
+              else:
+                  raise RuntimeError("Web app did not become ready")
+
+              page = Page()
+              page.feed(body.decode("utf-8"))
+              assert page.root, "Root page does not contain the React root"
+              assert page.modules, "Root page does not reference a built JavaScript module"
+              for source in page.modules:
+                  asset = urljoin(origin, source)
+                  assert urlparse(asset).netloc == urlparse(origin).netloc, "Module is not served by the app"
+                  assert urlparse(asset).path.endswith(".js"), "Module is not a built JavaScript asset"
+                  with urlopen(asset, timeout=5) as response:
+                      script = response.read()
+                      mime = response.headers.get_content_type()
+                      assert response.status == 200 and script, "JavaScript asset is missing or empty"
+                      assert mime in {"text/javascript", "application/javascript"}, f"JavaScript asset served as {mime}"
+                      assert not script.lstrip().lower().startswith((b"<!doctype html", b"<html")), "JavaScript asset contains HTML"
+                  print(f"JavaScript smoke passed: {source} ({mime}, {len(script)} bytes)")
+              print(f"Root smoke passed: HTTP 200, {len(body)} bytes, React root present")
+          except Exception:
+              subprocess.run(["docker", "compose", "-f", "docker-compose.local.yml", "logs", "--tail=160"])
+              raise
+          PY
 
       - name: Record results
         if: always()
         shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_TEST_RESULT: ${{ steps.source_tests.outcome }}
+          WEB_SMOKE_RESULT: ${{ steps.web_smoke.outcome }}
         run: |
           {
             echo "## M0 Docker smoke test"
             echo ""
-            echo "- AI coding image pull: ${{ steps.ai_image.outputs.pull_ok || 'not completed' }}"
-            echo "- AI coding image shell probe: ${{ steps.ai_image.outputs.shell_ok || 'not completed' }}"
-            echo "- Infinite Canvas source pin: ccda172efba25cbee990a785bba715b90cc42b95"
-            echo "- Application smoke test: see preceding step logs."
+            echo "- Tested source revision: $SOURCE_SHA"
+            echo "- Frontend source tests: $SOURCE_TEST_RESULT"
+            echo "- Root and JavaScript asset smoke test: $WEB_SMOKE_RESULT"
+            echo "- AI coding runtime: see the separate registry diagnostic; an OCI MCP profile cannot run as a container."
             echo ""
-            echo "The workflow does not save model API keys or publish the test app. Test data stays on the ephemeral runner."
+            echo "The static app requires no admin credentials or model API keys. The test app is not published."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up test containers
         if: always()
         shell: bash
         run: |
-          if [[ -d /tmp/infinite-canvas ]]; then
-            cd /tmp/infinite-canvas
-            docker compose -f docker-compose.local.yml down -v --remove-orphans || true
-          fi
+          docker compose -f docker-compose.local.yml down -v --remove-orphans || true

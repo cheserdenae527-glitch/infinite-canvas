@@ -15,29 +15,85 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Inspect public Docker Hub repository and latest manifest
+        id: manifest
         shell: bash
         run: |
           set -Eeuo pipefail
-          REPO="zoonqi/ai_coding"
-          TOKEN="$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)"
-          test -n "$TOKEN" && test "$TOKEN" != "null"
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from urllib.request import Request, urlopen
 
-          echo "## Docker Hub tags"
-          TAGS="$(curl -fsSL -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list?n=100")"
-          echo "$TAGS" | jq '{name, tags}'
+          repository = "zoonqi/ai_coding"
+          tag = "latest"
+          registry = f"https://registry-1.docker.io/v2/{repository}"
 
-          echo
-          echo "## latest manifest response"
-          ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
-          STATUS="$(curl -sS -o /tmp/manifest.json -D /tmp/manifest.headers -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" "https://registry-1.docker.io/v2/${REPO}/manifests/latest")"
-          echo "HTTP status: $STATUS"
-          grep -iE '^(content-type|docker-content-digest):' /tmp/manifest.headers || true
-          if [[ "$STATUS" != "200" ]]; then
-            cat /tmp/manifest.json
-            exit 1
-          fi
-          jq '{schemaVersion, mediaType, artifactType, config: (.config // null), layers: [.layers[]? | {mediaType, size, digest}], manifests: [.manifests[]? | {mediaType, digest, platform}]}' /tmp/manifest.json
+          def fetch(url, headers=None):
+              with urlopen(Request(url, headers=headers or {})) as response:
+                  return json.load(response), response.headers
 
-          echo
-          echo "## Docker CLI pull compatibility"
-          docker pull "docker.io/${REPO}:latest" || true
+          auth, _ = fetch(f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repository}:pull")
+          token = auth["token"]
+          if not token:
+              raise RuntimeError("Docker Hub returned an empty pull token")
+          print(f"::add-mask::{token}", flush=True)
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": ", ".join([
+                  "application/vnd.oci.image.index.v1+json",
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+              ]),
+          }
+          tags, _ = fetch(f"{registry}/tags/list?n=100", headers)
+          print(json.dumps(tags, indent=2))
+          manifest, response_headers = fetch(f"{registry}/manifests/{tag}", headers)
+          digest = response_headers["Docker-Content-Digest"]
+          print(f"Tag digest: {digest}")
+          print(json.dumps(manifest, indent=2))
+
+          selected_digest = digest
+          if "manifests" in manifest:
+              descriptor = next((item for item in manifest["manifests"]
+                  if item.get("platform", {}).get("os") == "linux"
+                  and item.get("platform", {}).get("architecture") == "amd64"), None)
+              if descriptor is None:
+                  raise RuntimeError("The image index has no linux/amd64 manifest")
+              selected_digest = descriptor["digest"]
+              manifest, _ = fetch(f"{registry}/manifests/{selected_digest}", headers)
+              print(f"Selected linux/amd64 manifest: {selected_digest}")
+              print(json.dumps(manifest, indent=2))
+
+          artifact_type = manifest.get("artifactType") or ""
+          config_type = manifest.get("config", {}).get("mediaType", "")
+          runnable = not artifact_type and config_type in {
+              "application/vnd.oci.image.config.v1+json",
+              "application/vnd.docker.container.image.v1+json",
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"runnable={str(runnable).lower()}\ndigest={digest}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(
+                  "## AI coding registry diagnostic\n\n"
+                  f"- Reference: `docker.io/{repository}:{tag}`\n"
+                  f"- Tags: `{', '.join(tags.get('tags') or [])}`\n"
+                  f"- Tag digest: `{digest}`\n"
+                  f"- Selected manifest: `{selected_digest}`\n"
+                  f"- Manifest media type: `{manifest.get('mediaType', '')}`\n"
+                  f"- Artifact type: `{artifact_type or 'none'}`\n"
+                  f"- Config media type: `{config_type}`\n"
+                  f"- Runnable container candidate: `{str(runnable).lower()}`\n"
+              )
+              if not runnable:
+                  summary.write("- Runtime probe: **BLOCKED**; this reference is an OCI artifact, not a runnable container image. Docker pull was skipped.\n")
+                  print("::warning::Runtime probe BLOCKED: the registry reference is an OCI artifact; runnable=false. Supply a runnable AI coding image reference.")
+              else:
+                  image = f"docker.io/{repository}@{digest}"
+                  result = subprocess.run(["docker", "pull", "--platform", "linux/amd64", image])
+                  summary.write(f"- Pull result: {'passed' if result.returncode == 0 else 'failed'} (linux/amd64, pinned tag digest)\n")
+                  summary.flush()
+                  result.check_returncode()
+                  subprocess.run(["docker", "image", "inspect", image], check=True)
+          PY
