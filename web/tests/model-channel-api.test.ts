@@ -7,7 +7,7 @@ if (typeof globalThis.localStorage === "undefined") {
     });
 }
 
-const [{ defaultConfig, encodeChannelModel }, { requestGeneration }, { createVideoGenerationTask, pollVideoGenerationTask }] = await Promise.all([
+const [{ defaultConfig, encodeChannelModel }, { fetchChannelModels, requestGeneration }, { createVideoGenerationTask, pollVideoGenerationTask }] = await Promise.all([
     import("../src/stores/use-config-store"),
     import("../src/services/api/image"),
     import("../src/services/api/video"),
@@ -51,6 +51,28 @@ test("image generation uses the selected channel credentials, model, and respons
         });
         expect(result).toHaveLength(1);
         expect(result[0]?.dataUrl).toBe("data:image/png;base64,AA==");
+    } finally {
+        server.stop();
+    }
+});
+
+test("model discovery uses the channel Base URL and credentials", async () => {
+    let received: { path: string; authorization: string | null } | undefined;
+    const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch(request) {
+            received = { path: new URL(request.url).pathname, authorization: request.headers.get("authorization") };
+            return Response.json({ data: [{ id: "z-image-model" }, { id: "a-image-model" }] });
+        },
+    });
+
+    try {
+        const config = channelConfig("image", "mock-image-model", "test-models-key", server.url.origin);
+        const models = await fetchChannelModels(config.channels[0]!);
+
+        expect(received).toEqual({ path: "/v1/models", authorization: "Bearer test-models-key" });
+        expect(models).toEqual(["a-image-model", "z-image-model"]);
     } finally {
         server.stop();
     }
