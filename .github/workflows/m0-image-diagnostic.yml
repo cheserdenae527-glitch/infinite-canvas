@@ -1,0 +1,43 @@
+name: M0 - Docker Hub image manifest diagnostic
+
+on:
+  push:
+    branches:
+      - codex/m0-container-probe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect public Docker Hub repository and latest manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          REPO="zoonqi/ai_coding"
+          TOKEN="$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" | jq -r .token)"
+          test -n "$TOKEN" && test "$TOKEN" != "null"
+
+          echo "## Docker Hub tags"
+          TAGS="$(curl -fsSL -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${REPO}/tags/list?n=100")"
+          echo "$TAGS" | jq '{name, tags}'
+
+          echo
+          echo "## latest manifest response"
+          ACCEPT="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+          STATUS="$(curl -sS -o /tmp/manifest.json -D /tmp/manifest.headers -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" "https://registry-1.docker.io/v2/${REPO}/manifests/latest")"
+          echo "HTTP status: $STATUS"
+          grep -iE '^(content-type|docker-content-digest):' /tmp/manifest.headers || true
+          if [[ "$STATUS" != "200" ]]; then
+            cat /tmp/manifest.json
+            exit 1
+          fi
+          jq '{schemaVersion, mediaType, artifactType, config: (.config // null), layers: [.layers[]? | {mediaType, size, digest}], manifests: [.manifests[]? | {mediaType, digest, platform}]}' /tmp/manifest.json
+
+          echo
+          echo "## Docker CLI pull compatibility"
+          docker pull "docker.io/${REPO}:latest" || true
