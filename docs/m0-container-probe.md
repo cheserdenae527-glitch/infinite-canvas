@@ -16,7 +16,9 @@
 
 诊断现在将这类内容报告为 `runnable=false`、`BLOCKED`，跳过容器拉取。诊断成功只表示已识别注册表内容。若后续引用提供真实的 OCI/Docker 运行配置，则按 digest 固定拉取 `linux/amd64` 镜像；拉取失败会让诊断失败。
 
-MCP profile 应通过 Docker MCP Toolkit 的 profile 导入功能使用。它不能替代 AI coding 工作容器；该运行环境仍需提供真实容器镜像。参见 [Docker MCP Profiles](https://docs.docker.com/ai/mcp-catalog-and-toolkit/profiles/) 和 [OCI artifact 规范](https://github.com/opencontainers/image-spec/blob/main/manifest.md#guidelines-for-artifact-usage)。
+MCP profile 应通过 Docker MCP Toolkit 的 profile 导入功能使用。项目现在在同一工作流的 `probe-codex-runtime` job 中，从固定 digest 的 Docker Official `node:22-bookworm-slim` 基础镜像构建临时 Codex 编程环境，安装固定版本的 Codex CLI 与 Bun，并在禁网容器中检查命令和当前源码挂载。镜像只在 GitHub Actions runner 上构建和运行，不推送到 registry；探测不提供模型凭证，也不会发送 Codex 请求。参见 [Docker MCP Profiles](https://docs.docker.com/ai/mcp-catalog-and-toolkit/profiles/)、[Docker Official Node image](https://hub.docker.com/_/node) 和 [Codex CLI 官方安装说明](https://github.com/openai/codex#readme)。
+
+这个临时镜像覆盖 Infinite Canvas 当前的 Node/Bun 开发工具链与 Codex CLI。要实际运行模型调用，用户仍需在自己的运行环境中配置 Codex 登录；M0 探测刻意不处理登录或凭证。
 
 ## 当前应用检查
 

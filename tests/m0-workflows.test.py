@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -24,6 +25,7 @@ PROFILE = {
 def python_step(filename, name):
     workflow = (REPO / '.github/workflows' / filename).read_text(encoding='utf-8')
     step = workflow.split(f'      - name: {name}\n', 1)[1].split('\n      - name:', 1)[0]
+    step = re.split(r'\n  [a-z0-9-]+:\n    runs-on:', step, maxsplit=1)[0]
     script = textwrap.dedent(step.split('        run: |\n', 1)[1])
     if "python3 - <<'PY'\n" not in script:
         raise AssertionError('No manifest classifier: workflow still attempts Docker pull unconditionally')
@@ -156,6 +158,25 @@ class StaticAppSmokeTests(unittest.TestCase):
                                                script=b'<!doctype html><html>fallback</html>')
         self.assertIn('contains HTML', str(error))
         self.assertEqual(logs, 1)
+
+
+class CodingRuntimeImageTests(unittest.TestCase):
+    def test_runtime_base_and_tool_versions_are_pinned(self):
+        dockerfile = (REPO / 'docker/ai-coding-runtime/Dockerfile').read_text(encoding='utf-8')
+        self.assertRegex(dockerfile.splitlines()[0], r'^FROM node:22-bookworm-slim@sha256:[0-9a-f]{64}$')
+        self.assertIn('@openai/codex@0.163.0', dockerfile)
+        self.assertIn('bun@1.3.13', dockerfile)
+
+    def test_runtime_probe_is_ephemeral_offline_and_credential_free(self):
+        workflow = (REPO / '.github/workflows/m0-image-diagnostic.yml').read_text(encoding='utf-8')
+        runtime_job = workflow.split('  probe-codex-runtime:\n', 1)[1]
+        self.assertIn('docker build --platform linux/amd64 -f docker/ai-coding-runtime/Dockerfile', runtime_job)
+        self.assertIn('--network none', runtime_job)
+        self.assertIn('--volume "$GITHUB_WORKSPACE:/workspace:ro"', runtime_job)
+        self.assertIn('codex --version', runtime_job)
+        self.assertNotIn('docker push', runtime_job)
+        self.assertNotIn('OPENAI_API_KEY', runtime_job)
+        self.assertNotIn('CODEX_API_KEY', runtime_job)
 
 
 if __name__ == '__main__':
